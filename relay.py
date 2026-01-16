@@ -12,7 +12,8 @@ def main():
         rpiplc.delay(1000)
         rpiplc.digital_write("R1.3", rpiplc.LOW)
 
-     
+
+#TEST
 
 if __name__ == "__main__":
       main()
