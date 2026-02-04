@@ -4,6 +4,15 @@
 # ENVIROMED Quick Controls (RS-485) + RPIPLC analog + Plates/Homing + Roller
 # + SLF3x/SCC1 flow meter integration + volume-based auto-stop
 # + Flowmeter power relay (RPIPLC R1.2) ON/OFF/CYCLE buttons
+#
+# NO-RESET FIX:
+# - Start threshold is DISPLAY ONLY (does not reset baseline/delivered ever).
+# - baseline_total is set ONCE at pump_start. delivered never resets until run ends.
+#
+# GLITCH FIX:
+# - Flow integration ignores corrupt batches (spikes/outliers).
+# - Flow is clamped and outliers removed vs median.
+# - If batch deemed corrupt => do NOT integrate and do NOT update flow (hold last good).
 
 from flask import Flask, request, jsonify, render_template_string
 import time
@@ -11,10 +20,16 @@ import threading
 from contextlib import contextmanager
 
 SERIAL_LOCK = threading.Lock()
-
 import commands  # your module with ser + write(...)
 
-# If your stepper driver needs a different baud for homing. None keeps current.
+# -------------------------
+# Calibration (backup knob)
+# -------------------------
+FLOW_CAL = 1  # keep 1.00 while fixing glitches; adjust later if needed (e.g. 1.10)
+
+# -------------------------
+# Stepper homing baud (optional)
+# -------------------------
 HOMING_BAUD = None  # e.g., 115200 or 57600
 
 @contextmanager
@@ -55,11 +70,8 @@ except Exception as e:
 RPIPLC_BOARD = "RPIPLC_V6"
 RPIPLC_MODEL = "RPIPLC_38AR"
 
-# Flowmeter power relay (same as your logger)
 FLOW_PWR_RELAY_CH = "R1.2"   # SCC1 power relay
-FLOW_PWR_ASSUME_HIGH_ON = True  # HIGH = ON like your script
-
-# Analog output pin (your existing)
+FLOW_PWR_ASSUME_HIGH_ON = True
 AO_PIN = "A0.5"
 
 # -------------------------
@@ -71,7 +83,7 @@ from sensirion_uart_scc1.drivers.scc1_slf3x import Scc1Slf3x
 from sensirion_uart_scc1.drivers.slf_common import get_flow_unit_label
 from sensirion_uart_scc1.scc1_shdlc_device import Scc1ShdlcDevice
 
-# Optional RS485 RTS/DE control via pyserial (usually OFF on PLC ports)
+# Optional RS485 RTS/DE control via pyserial (usually OFF)
 try:
     from serial.rs485 import RS485Settings
 except Exception:
@@ -82,27 +94,58 @@ except Exception:
 # -------------------------
 FLOW_PORT = "/dev/ttySC3"
 FLOW_ADDR = 0
-FLOW_INTERVAL_MS = 2
+FLOW_INTERVAL_MS = 2  # SCC1 config only
 
-TARGET_ML_DEFAULT = 20.0
+TARGET_ML_DEFAULT = 50.0
+
+# Keep for display; DOES NOT control reset anymore
 START_THRESHOLD_ML_MIN_DEFAULT = 0.5
-STATUS_POLL_MS = 100  # JS poll interval (100 ms)
 
+STATUS_POLL_MS = 100
+
+COMPENSATE_LOST_SAMPLES = True
+FLOW_INTEGRATION_DEBUG = False
+
+# -------------------------
+# GLITCH FILTER PARAMETERS  (IMPORTANT)
+# -------------------------
+# Set MAX_FLOW_ML_MIN to something safely above real max.
+# Example: if pump is normally <= 60 mL/min, set 90.
+MAX_FLOW_ML_MIN = 90.0
+
+# Outlier rejection vs median:
+# Keep samples within ±ABS_OUTLIER_ML_MIN and within (median * REL_OUTLIER_FACTOR)
+ABS_OUTLIER_ML_MIN = 25.0
+REL_OUTLIER_FACTOR = 2.5
+
+# If too few samples survive filtering, treat the whole batch as corrupt and ignore it.
+MIN_GOOD_SAMPLES = 3
+
+# If a batch mean jumps insanely compared to last good, ignore batch (prevents rare "all wrong" batches)
+MAX_STEP_JUMP_ML_MIN = 40.0
+
+# Optional: cap how much volume can be added per batch (extra safety)
+CAP_DV_PER_BATCH_ML = 5.0  # if dt_total is large and glitch happens, cap contribution
+
+# -------------------------
+# State
+# -------------------------
 FLOW_LOCK = threading.Lock()
 FLOW_STATE = {
     "ok": False,
-    "ml_min": 0.0,
+    "ml_min": 0.0,       # last good flow
     "temp_c": 0.0,
     "unit": "mL/min",
     "last_ts": 0.0,
     "err": "",
+    "total_ml": 0.0,     # cumulative integrated volume since server start
 }
 
 VOLUME_LOCK = threading.Lock()
 VOLUME_RUN = {
     "active": False,
     "target_ml": TARGET_ML_DEFAULT,
-    "start_threshold_ml_min": START_THRESHOLD_ML_MIN_DEFAULT,
+    "start_threshold_ml_min": START_THRESHOLD_ML_MIN_DEFAULT,  # display only
     "delivered_ml": 0.0,
     "started_integrating": False,
     "start_ts": 0.0,
@@ -112,8 +155,8 @@ STOP_VOLUME_EVENT = threading.Event()
 
 PWR_LOCK = threading.Lock()
 POWER_STATE = {
-    "relay_ok": False,   # RPIPLC available + pin configured
-    "flow_power_on": None,  # True/False/None(unknown)
+    "relay_ok": False,
+    "flow_power_on": None,
     "err": "",
 }
 
@@ -121,7 +164,6 @@ POWER_STATE = {
 # RS-485 command bytes
 # -------------------------
 CMD = {
-    # Movement / pump / base
     "move_base_front_on":   b'\x01\x06\x00\x08\x01\x00\x09\x98',
     "move_base_front_off":  b'\x01\x06\x00\x08\x02\x00\x09\x68',
     "pump_start":           b'\x01\x06\x00\x06\x01\x00\x68\x5B',
@@ -129,11 +171,9 @@ CMD = {
     "base_back_on":         b'\x01\x06\x00\x04\x01\x00\xC9\x9B',
     "base_back_off":        b'\x01\x06\x00\x04\x02\x00\xC9\x6B',
 
-    # Roller (relay 7)
     "roller_start":         b'\x01\x06\x00\x07\x01\x00\x39\x9B',
     "roller_stop":          b'\x01\x06\x00\x07\x02\x00\x39\x6B',
 
-    # Valves (OPEN/CLOSE)
     "valve1_open":          b'\x01\x06\x00\x01\x01\x00\xD9\x9A',
     "valve1_close":         b'\x01\x06\x00\x01\x02\x00\xD9\x6A',
 
@@ -150,15 +190,12 @@ CMD = {
     "valve5_close":         b'\x01\x06\x00\x05\x02\x00\x98\xAB',
 }
 
-# Homing commands
 command_homing1 = b'\x4E\x10\xA7\x9E\x00\x07\x0E\x07\x00\x00\x03\x01\xF4\x00\x00\x03\xE8\x00\x00\x27\x10\xF8\x65'
 command_homing2 = b'\x4E\x10\xA7\x9E\x00\x07\x0E\x07\x00\x02\x03\x01\xF4\x00\x00\x03\xE8\x00\x00\x27\x10\x01\xA2'
 
-# Plates
 command_stepper_open  = b'\x4E\x10\xA7\x9E\x00\x07\x0E\x01\x00\x00\x03\x03\xE8\x00\x00\x4E\x20\x00\x00\x00\x00\x33\x58'
 command_stepper_press = b'\x4E\x10\xA7\x9E\x00\x07\x0E\x01\x00\x00\x03\x03\xE8\x00\x00\x4E\x20\x00\x89\x54\x40\xDD\x82'
 
-# Roller bump duration
 ROLLER_BUMP_SECONDS = 6
 
 app = Flask(__name__)
@@ -279,7 +316,6 @@ async function pollStatus(){
     const r = await fetch("/status", {cache:"no-store"});
     const s = await r.json();
 
-    // Flow pills
     const flowOkEl = document.getElementById("flowOk");
     const flowEl = document.getElementById("flowPill");
     const tempEl = document.getElementById("tempPill");
@@ -288,7 +324,6 @@ async function pollStatus(){
     const stEl   = document.getElementById("startThPill");
     const stateEl= document.getElementById("runStatePill");
     const flowErrEl = document.getElementById("flowErrText");
-
     const pwrEl = document.getElementById("pwrPill");
 
     if (s.flow_ok){
@@ -316,14 +351,13 @@ async function pollStatus(){
     stEl.textContent  = `Start@ ${fmtNum(vr.start_threshold_ml_min || 0, 1)} mL/min`;
 
     if (active){
-      stateEl.textContent = started ? "RUN: integrating" : "RUN: waiting flow";
+      stateEl.textContent = started ? "RUN: integrating" : "RUN: starting";
       stateEl.style.background = "#e6f0ff";
     } else {
       stateEl.textContent = stopReason ? `RUN: stopped (${stopReason})` : "RUN: idle";
       stateEl.style.background = "#f1f1f1";
     }
 
-    // Power relay pill
     if (s.power && s.power.relay_ok){
       const on = s.power.flow_power_on;
       if (on === true){
@@ -341,7 +375,6 @@ async function pollStatus(){
       pwrEl.style.background = "#f1f1f1";
     }
 
-    // Auto-stop behavior: stop timer + log once
     if (lastVolumeActive && !active && stopReason && stopReason.includes("target reached")){
       if (pumpTimerInterval){
         stopPumpTimer();
@@ -353,9 +386,7 @@ async function pollStatus(){
     }
     lastVolumeActive = active;
 
-  }catch(e){
-    // ignore occasional fetch errors
-  }
+  }catch(e){}
 }
 
 window.addEventListener("load", ()=>{
@@ -366,7 +397,7 @@ window.addEventListener("load", ()=>{
 </head>
 <body>
   <h1>ENVIROMED — Quick Controls</h1>
-  <p class="muted">RS-485 bytes via <code>commands.ser.write(...)</code> & <code>commands.write(...)</code> • RPIPLC analog output via <code>librpiplc</code> • Flow auto-stop: integrate after flow ≥ threshold, stop at target mL</p>
+  <p class="muted">Start@ is display only • Volume never resets on flow glitches • Corrupt batches ignored</p>
 
   <div class="section">Movement & Pump</div>
   <div class="grid">
@@ -376,7 +407,7 @@ window.addEventListener("load", ()=>{
     <div></div>
 
     <div class="rowlabel">Peristaltic Pump</div>
-    <button class="start" onclick="send('pump_start','Pump START (auto 20mL)')">START</button>
+    <button class="start" onclick="send('pump_start','Pump START (auto)')">START</button>
     <button class="stop"  onclick="send('pump_stop','Pump STOP')">STOP</button>
     <span id="pumpTimer" class="pill">00:00:00</span>
 
@@ -468,7 +499,6 @@ window.addEventListener("load", ()=>{
     <input id="dacval" type="number" min="0" max="4095" step="1" value="4095">
     <button onclick="setAnalog()">Set A0.5</button>
   </div>
-  <p class="muted">Initialized at server start with <code>rpiplc.init("RPIPLC_V6", "RPIPLC_38AR")</code> and <code>pin_mode("A0.5", OUTPUT)</code>.</p>
 
   <div id="log"></div>
 </body>
@@ -508,20 +538,15 @@ def rpiplc_init_once():
 
     try:
         rpiplc.init(RPIPLC_BOARD, RPIPLC_MODEL)
-
-        # Analog pin (optional)
         try:
             rpiplc.pin_mode(AO_PIN, rpiplc.OUTPUT)
         except Exception:
             pass
-
-        # Flow power relay pin
         rpiplc.pin_mode(FLOW_PWR_RELAY_CH, rpiplc.OUTPUT)
 
         with PWR_LOCK:
             POWER_STATE["relay_ok"] = True
             POWER_STATE["err"] = ""
-            # we don't know actual state; set to "assume ON" after we command it
             POWER_STATE["flow_power_on"] = None
 
     except Exception as e:
@@ -552,10 +577,7 @@ def flow_power_cycle(off_ms=1500, on_ms=2500):
     flow_power_on()
     rpiplc.delay(int(on_ms))
 
-# Init RPIPLC on startup (if present)
 rpiplc_init_once()
-
-# Optional: ensure SCC1 is powered ON at server start
 if HAVE_RPIPLC:
     try:
         flow_power_on()
@@ -566,33 +588,8 @@ if HAVE_RPIPLC:
 # -------------------------
 # Flow sensor thread
 # -------------------------
-def enable_rs485_mode(shdlc_port):
-    if RS485Settings is None:
-        return
-    candidates = ["_serial", "serial", "_ser", "_port", "port"]
-    ser = None
-    for name in candidates:
-        obj = getattr(shdlc_port, name, None)
-        if obj is not None and hasattr(obj, "rs485_mode"):
-            ser = obj
-            break
-    if ser is None:
-        return
-
-    ser.rs485_mode = RS485Settings(
-        rts_level_for_tx=True,
-        rts_level_for_rx=False,
-        delay_before_tx=0.0,
-        delay_before_rx=0.0,
-    )
-    if hasattr(ser, "rts"):
-        ser.rts = False
-
 def init_slf3x_sensor(serial_port: str, address: int, interval_ms: int):
     port = ShdlcSerialPort(port=serial_port, baudrate=115200)
-    # If you ever need RTS direction control, uncomment:
-    # enable_rs485_mode(port)
-
     device = Scc1ShdlcDevice(ShdlcConnection(port), slave_address=address)
     sensor = Scc1Slf3x(device)
 
@@ -605,7 +602,18 @@ def init_slf3x_sensor(serial_port: str, address: int, interval_ms: int):
     sensor.start_continuous_measurement(interval_ms=interval_ms)
     return port, sensor, flow_scale, unit_label
 
+def _median(vals):
+    s = sorted(vals)
+    n = len(s)
+    if n == 0:
+        return 0.0
+    mid = n // 2
+    return s[mid] if (n % 2 == 1) else 0.5 * (s[mid - 1] + s[mid])
+
 def flow_reader_thread():
+    last_good_flow = 0.0
+    last_good_temp = 0.0
+
     while True:
         port = None
         sensor = None
@@ -617,25 +625,101 @@ def flow_reader_thread():
             )
             with FLOW_LOCK:
                 FLOW_STATE["ok"] = True
-                FLOW_STATE["unit"] = unit_label  # you said this is mL/min
+                FLOW_STATE["unit"] = unit_label
                 FLOW_STATE["err"] = ""
+
+            last_batch_t = time.monotonic()
+            last_debug_bucket = -1
 
             while True:
                 remaining, lost, data = sensor.read_extended_buffer()
                 if not data:
                     continue
 
-                flow_vals = [(f / flow_scale) for (f, temp, flag) in data]
-                temp_vals = [(temp / 200.0) for (f, temp, flag) in data]
-                flow_val = sum(flow_vals) / len(flow_vals)
-                temp_c = sum(temp_vals) / len(temp_vals)
-                
+                now_t = time.monotonic()
+                dt_total = now_t - last_batch_t
+                last_batch_t = now_t
+
+                raw_flow = [(FLOW_CAL * (f / flow_scale)) for (f, temp, flag) in data]
+                raw_temp = [(temp / 200.0) for (f, temp, flag) in data]
+
+                # Hard clamp negatives and insane highs
+                clamped = []
+                for x in raw_flow:
+                    if x < 0:
+                        x = 0.0
+                    if x > MAX_FLOW_ML_MIN:
+                        x = MAX_FLOW_ML_MIN
+                    clamped.append(x)
+
+                med = _median(clamped)
+
+                # Filter outliers vs median
+                good = []
+                for x in clamped:
+                    if abs(x - med) <= ABS_OUTLIER_ML_MIN and x <= (med * REL_OUTLIER_FACTOR + 1e-9):
+                        good.append(x)
+
+                if len(good) < MIN_GOOD_SAMPLES:
+                    # Batch is garbage -> ignore it completely, do not integrate, do not update flow
+                    with FLOW_LOCK:
+                        FLOW_STATE["ok"] = True  # comms fine, just data garbage
+                        FLOW_STATE["ml_min"] = float(last_good_flow)
+                        FLOW_STATE["temp_c"] = float(last_good_temp)
+                        FLOW_STATE["last_ts"] = time.time()
+                        FLOW_STATE["err"] = "glitch batch ignored"
+                    continue
+
+                flow_mean = sum(good) / len(good)
+                temp_mean = sum(raw_temp) / len(raw_temp) if raw_temp else last_good_temp
+
+                # If mean jumps too far, treat as glitch (ignore batch)
+                if abs(flow_mean - last_good_flow) > MAX_STEP_JUMP_ML_MIN:
+                    with FLOW_LOCK:
+                        FLOW_STATE["ok"] = True
+                        FLOW_STATE["ml_min"] = float(last_good_flow)
+                        FLOW_STATE["temp_c"] = float(last_good_temp)
+                        FLOW_STATE["last_ts"] = time.time()
+                        FLOW_STATE["err"] = "flow jump ignored"
+                    continue
+
+                # Integrate volume from good samples only (and optionally lost)
+                lost_n = int(lost) if (lost is not None and lost > 0) else 0
+                n_total = len(good) + (lost_n if COMPENSATE_LOST_SAMPLES else 0)
+                if n_total <= 0:
+                    continue
+
+                dt_per = dt_total / float(n_total)
+                dV_ml = (sum(good) * dt_per) / 60.0
+
+                if COMPENSATE_LOST_SAMPLES and lost_n > 0:
+                    dV_ml += (lost_n * flow_mean * dt_per) / 60.0
+
+                # Safety cap
+                if dV_ml < 0:
+                    dV_ml = 0.0
+                if dV_ml > CAP_DV_PER_BATCH_ML:
+                    dV_ml = CAP_DV_PER_BATCH_ML
+
+                last_good_flow = flow_mean
+                last_good_temp = temp_mean
 
                 with FLOW_LOCK:
-                    FLOW_STATE["ml_min"] = float(flow_val)
-                    FLOW_STATE["temp_c"] = float(temp_c)
+                    FLOW_STATE["ml_min"] = float(flow_mean)
+                    FLOW_STATE["temp_c"] = float(temp_mean)
                     FLOW_STATE["last_ts"] = time.time()
                     FLOW_STATE["ok"] = True
+                    FLOW_STATE["err"] = ""
+                    FLOW_STATE["total_ml"] = float(FLOW_STATE.get("total_ml", 0.0) + dV_ml)
+
+                if FLOW_INTEGRATION_DEBUG:
+                    bucket = int(time.time()) // 5
+                    if bucket != last_debug_bucket:
+                        last_debug_bucket = bucket
+                        print(
+                            f"[FLOW] batch={len(data)} good={len(good)} lost={lost_n} "
+                            f"dt_total={dt_total*1000.0:.1f}ms flow={flow_mean:.2f} {unit_label}"
+                        )
 
         except (ShdlcDeviceError, ShdlcTimeoutError) as e:
             with FLOW_LOCK:
@@ -665,55 +749,39 @@ def flow_reader_thread():
 
 def get_flow_ml_min() -> float:
     with FLOW_LOCK:
-        f = float(FLOW_STATE.get("ml_min", 0.0) or 0.0)
-    return max(0.0, f)
+        return float(FLOW_STATE.get("ml_min", 0.0) or 0.0)
 
 threading.Thread(target=flow_reader_thread, daemon=True).start()
 
 # -------------------------
-# Volume-run auto-stop thread
+# Volume-run auto-stop thread  (baseline set ONCE at START; NEVER resets)
 # -------------------------
-def volume_run_thread(target_ml: float, start_threshold_ml_min: float):
+def volume_run_thread(target_ml: float, start_threshold_ml_min_display: float):
     with VOLUME_LOCK:
         VOLUME_RUN["active"] = True
         VOLUME_RUN["target_ml"] = float(target_ml)
-        VOLUME_RUN["start_threshold_ml_min"] = float(start_threshold_ml_min)
+        VOLUME_RUN["start_threshold_ml_min"] = float(start_threshold_ml_min_display)  # display only
         VOLUME_RUN["delivered_ml"] = 0.0
-        VOLUME_RUN["started_integrating"] = False
+        VOLUME_RUN["started_integrating"] = True
         VOLUME_RUN["start_ts"] = time.time()
         VOLUME_RUN["stop_reason"] = ""
 
     STOP_VOLUME_EVENT.clear()
 
-    delivered = 0.0
-    t_prev = time.monotonic()
+    # baseline set ONCE here
+    with FLOW_LOCK:
+        baseline_total = float(FLOW_STATE.get("total_ml", 0.0))
 
     try:
         while not STOP_VOLUME_EVENT.wait(0.05):
-            flow_now = get_flow_ml_min()
-            now = time.monotonic()
+            with FLOW_LOCK:
+                total_ml = float(FLOW_STATE.get("total_ml", 0.0))
 
-            with VOLUME_LOCK:
-                started = bool(VOLUME_RUN["started_integrating"])
-                tgt = float(VOLUME_RUN["target_ml"])
-                thr = float(VOLUME_RUN["start_threshold_ml_min"])
-
-            if not started:
-                if flow_now >= thr:
-                    with VOLUME_LOCK:
-                        VOLUME_RUN["started_integrating"] = True
-                    t_prev = now
-                else:
-                    t_prev = now
-                    continue
-
-            dt = now - t_prev
-            t_prev = now
-
-            delivered += (flow_now * dt) / 60.0
+            delivered = max(0.0, total_ml - baseline_total)
 
             with VOLUME_LOCK:
                 VOLUME_RUN["delivered_ml"] = delivered
+                tgt = float(VOLUME_RUN["target_ml"])
 
             if delivered >= tgt:
                 try:
@@ -749,7 +817,6 @@ def send():
         return jsonify(ok=False, error=f"Unknown action: {action}"), 400
 
     try:
-        # ---- Flow power relay controls ----
         if action == "flow_power_on":
             flow_power_on()
             return jsonify(ok=True, hex=f"{FLOW_PWR_RELAY_CH}=ON")
@@ -764,7 +831,6 @@ def send():
             flow_power_cycle(off_ms=1500, on_ms=2500)
             return jsonify(ok=True, hex=f"{FLOW_PWR_RELAY_CH}=CYCLE (1500ms off, 2500ms on)")
 
-        # ---- Existing special actions ----
         if action == "plates_open":
             with SERIAL_LOCK:
                 try:
@@ -788,7 +854,6 @@ def send():
             threading.Timer(ROLLER_BUMP_SECONDS, lambda: _write_bytes_threadsafe(CMD["roller_stop"])).start()
             return jsonify(ok=True, hex=f"{hexify(CMD['roller_start'])} (auto-stop in {ROLLER_BUMP_SECONDS}s)")
 
-        # ---- Pump start/stop with volume auto-stop ----
         if action == "pump_start":
             with SERIAL_LOCK:
                 try:
@@ -798,7 +863,6 @@ def send():
                 commands.ser.write(CMD["pump_start"])
                 commands.ser.flush()
 
-            # Cancel any previous volume run and start a new one
             STOP_VOLUME_EVENT.set()
             time.sleep(0.05)
             STOP_VOLUME_EVENT.clear()
@@ -829,7 +893,6 @@ def send():
 
             return jsonify(ok=True, hex=hexify(CMD["pump_stop"]))
 
-        # ---- Default raw CMD write ----
         with SERIAL_LOCK:
             try:
                 commands.ser.reset_input_buffer(); commands.ser.reset_output_buffer()
@@ -886,6 +949,7 @@ def status():
         flow_err = str(FLOW_STATE["err"])
         last_ts = float(FLOW_STATE["last_ts"])
         unit = str(FLOW_STATE["unit"])
+        total_ml = float(FLOW_STATE.get("total_ml", 0.0))
 
     with VOLUME_LOCK:
         vr = dict(VOLUME_RUN)
@@ -900,6 +964,7 @@ def status():
         flow_err=flow_err,
         flow_last_ts=last_ts,
         flow_unit=unit,
+        flow_total_ml=total_ml,
         volume_run=vr,
         power=pwr,
     )
