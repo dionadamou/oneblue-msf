@@ -1,7 +1,22 @@
 #!/usr/bin/env python3
 # control_api.py — Flask backend for your current frontend (safe start)
+#
+# HOMING (WORKING REFERENCE APPLIED):
+# - rpiplc.init("RPIPLC_V6", "RPIPLC_38AR")  ✅ (matches your proven snippet)
+# - Limit switch on I1.5 by default          ✅
+# - Detects HIGH -> LOW -> HIGH
+#
+# ENV VARS (optional):
+#   HOME_LIMIT_PIN=I1.5
+#   HOME_TIMEOUT_S=90
+#   HOME_POLL_MS=10                # polling interval in ms
+#   HOME_STABLE_COUNT=5            # consecutive reads needed to accept a state
+#
+# Notes:
+# - pressed = LOW, released = HIGH (your statement)
+# - If you start already LOW, we first wait to see a HIGH (release), then proceed.
 
-import time, threading, os, sys
+import time, threading, os
 from flask import Flask, request, jsonify
 
 # -------- Safe import for RS-485 "commands" helper --------
@@ -20,10 +35,7 @@ except Exception as e:
     commands = _CommandsStub()
 
 # -------- Frontend build path (adjust if needed) ----------
-# in /home/pi/maria/control_api.py
 FRONTEND_DIST = "/home/pi/projects/msf-ui/dist/"
-
-
 
 app = Flask(
     __name__,
@@ -31,7 +43,6 @@ app = Flask(
     static_url_path="/"
 )
 
-# homepage -> serve the built index.html (will 404 if path wrong)
 @app.get("/")
 def index():
     return app.send_static_file("index.html")
@@ -39,74 +50,137 @@ def index():
 # =========================
 # RS-485 command bytes (unchanged)
 # =========================
-command_homing1            = b'\x4E\x10\xA7\x9E\x00\x07\x0E\x07\x00\x00\x03\x01\xF4\x00\x00\x03\xE8\x00\x00\x27\x10\xF8\x65'
-command_homing2            = b'\x4E\x10\xA7\x9E\x00\x07\x0E\x07\x00\x02\x03\x01\xF4\x00\x00\x03\xE8\x00\x00\x27\x10\x01\xA2'
+command_homing1             = b'\x4E\x10\xA7\x9E\x00\x07\x0E\x07\x00\x00\x03\x01\xF4\x00\x00\x03\xE8\x00\x00\x27\x10\xF8\x65'
+command_homing2             = b'\x4E\x10\xA7\x9E\x00\x07\x0E\x07\x00\x02\x03\x01\xF4\x00\x00\x03\xE8\x00\x00\x27\x10\x01\xA2'
 
-command_start_roller       = b'\x01\x06\x00\x07\x01\x00\x39\x9B'
-command_stop_roller        = b'\x01\x06\x00\x07\x02\x00\x39\x6B'
+command_start_roller        = b'\x01\x06\x00\x07\x01\x00\x39\x9B'
+command_stop_roller         = b'\x01\x06\x00\x07\x02\x00\x39\x6B'
 
-command_base_back_on       = b'\x01\x06\x00\x04\x01\x00\xC9\x9B'
-command_base_back_off      = b'\x01\x06\x00\x04\x02\x00\xC9\x6B'
+command_base_back_on        = b'\x01\x06\x00\x04\x01\x00\xC9\x9B'
+command_base_back_off       = b'\x01\x06\x00\x04\x02\x00\xC9\x6B'
 
 command_move_base_front_on  = b'\x01\x06\x00\x08\x01\x00\x09\x98'
 command_move_base_front_off = b'\x01\x06\x00\x08\x02\x00\x09\x68'
 
-command_stepper_press      = b'\x4E\x10\xA7\x9E\x00\x07\x0E\x01\x00\x00\x03\x03\xE8\x00\x00\x4E\x20\x00\x72\x70\xE0\xB7\x0B'
-command_stepper_open       = b'\x4E\x10\xA7\x9E\x00\x07\x0E\x01\x00\x00\x03\x03\xE8\x00\x00\x4E\x20\x00\x00\x00\x00\x33\x58'
+command_stepper_press       = b'\x4E\x10\xA7\x9E\x00\x07\x0E\x01\x00\x00\x03\x03\xE8\x00\x00\x4E\x20\x00\x72\x70\xE0\xB7\x0B'
+command_stepper_open        = b'\x4E\x10\xA7\x9E\x00\x07\x0E\x01\x00\x00\x03\x03\xE8\x00\x00\x4E\x20\x00\x00\x00\x00\x33\x58'
 
-command_open_valve1        = b'\x01\x06\x00\x01\x01\x00\xD9\x9A'
-command_open_valve2        = b'\x01\x06\x00\x02\x01\x00\x29\x9A'
-command_open_valve3        = b'\x01\x06\x00\x03\x01\x00\x78\x5A'
-command_open_valve4        = b'\x01\x06\x00\x04\x01\x00\xC9\x9B'
-command_open_valve5        = b'\x01\x06\x00\x05\x01\x00\x98\x5B'
+command_open_valve1         = b'\x01\x06\x00\x01\x01\x00\xD9\x9A'
+command_open_valve2         = b'\x01\x06\x00\x02\x01\x00\x29\x9A'
+command_open_valve3         = b'\x01\x06\x00\x03\x01\x00\x78\x5A'
+command_open_valve4         = b'\x01\x06\x00\x04\x01\x00\xC9\x9B'
+command_open_valve5         = b'\x01\x06\x00\x05\x01\x00\x98\x5B'
 
-command_start_pump         = b'\x01\x06\x00\x06\x01\x00\x68\x5B'
-command_stop_pump          = b'\x01\x06\x00\x06\x02\x00\x68\xAB'
+command_start_pump          = b'\x01\x06\x00\x06\x01\x00\x68\x5B'
+command_stop_pump           = b'\x01\x06\x00\x06\x02\x00\x68\xAB'
 
-command_close_valve1       = b'\x01\x06\x00\x01\x02\x00\xD9\x6A'
-command_close_valve2       = b'\x01\x06\x00\x02\x02\x00\x29\x6A'
-command_close_valve3       = b'\x01\x06\x00\x03\x02\x00\x78\xAA'
-command_close_valve4       = b'\x01\x06\x00\x04\x02\x00\xC9\x6B'
-command_close_valve5       = b'\x01\x06\x00\x05\x02\x00\x98\xAB'
+command_close_valve1        = b'\x01\x06\x00\x01\x02\x00\xD9\x6A'
+command_close_valve2        = b'\x01\x06\x00\x02\x02\x00\x29\x6A'
+command_close_valve3        = b'\x01\x06\x00\x03\x02\x00\x78\xAA'
+command_close_valve4        = b'\x01\x06\x00\x04\x02\x00\xC9\x6B'
+command_close_valve5        = b'\x01\x06\x00\x05\x02\x00\x98\xAB'
 
 # =========================
-# DAC (RPIPLC) helpers
+# RPIPLC (AO + digital input)
 # =========================
 try:
     from librpiplc import rpiplc
-    _AO_AVAILABLE = True
+    _RPIPLC_AVAILABLE = True
 except Exception as e:
     print(f"[WARN] librpiplc not available: {e}")
     rpiplc = None
-    _AO_AVAILABLE = False
+    _RPIPLC_AVAILABLE = False
 
 AO_PIN   = "A0.5"
 AO_READY = False
 
-def ao_init():
+HOME_LIMIT_PIN = os.environ.get("HOME_LIMIT_PIN", "I1.5").strip()
+HOME_TIMEOUT_S = float(os.environ.get("HOME_TIMEOUT_S", "90"))
+HOME_POLL_MS = int(os.environ.get("HOME_POLL_MS", "10"))
+HOME_STABLE_COUNT = int(os.environ.get("HOME_STABLE_COUNT", "5"))
+
+def rpiplc_init():
+    """
+    IMPORTANT: Use the same init profile as your proven working digital_read snippet.
+    """
     global AO_READY
-    if not _AO_AVAILABLE:
-        print("[AO] librpiplc not available: DAC NO-OP.")
+    if not _RPIPLC_AVAILABLE:
+        print("[RPIPLC] Not available: AO + input read disabled.")
         AO_READY = False
         return
+
+    rpiplc.init("RPIPLC_V6", "RPIPLC_38AR")
+
+    # AO pin
     try:
-        rpiplc.init("RPIPLC_V6", "RPIPLC_21")
         rpiplc.pin_mode(AO_PIN, rpiplc.OUTPUT)
         AO_READY = True
         print(f"[AO] Ready on {AO_PIN}")
     except Exception as e:
-        print(f"[AO] init failed: {e}")
         AO_READY = False
+        print(f"[AO] setup failed on {AO_PIN}: {e}")
+
+    # Home input pin
+    try:
+        rpiplc.pin_mode(HOME_LIMIT_PIN, rpiplc.INPUT)
+        print(f"[HOME] Limit input ready: {HOME_LIMIT_PIN}")
+    except Exception as e:
+        print(f"[HOME] Limit input setup FAILED on {HOME_LIMIT_PIN}: {e}")
 
 def ao(value: int):
     v = max(0, min(4095, int(value)))
-    if AO_READY and _AO_AVAILABLE:
+    if AO_READY and _RPIPLC_AVAILABLE:
         try:
             rpiplc.analog_write(AO_PIN, v)
         except Exception as e:
             print(f"[AO] write failed: {e}")
     else:
         print(f"[AO] (no-op) {AO_PIN} = {v}")
+
+def _read_pin(pin: str) -> int:
+    # raw read like your working snippet
+    return 1 if rpiplc.digital_read(pin) else 0
+
+def _wait_stable(pin: str, target: int, stable_count: int, poll_s: float,
+                 deadline: float, stop_event: threading.Event = None) -> None:
+    consec = 0
+    while True:
+        if stop_event is not None and stop_event.is_set():
+            raise RuntimeError("Aborted (STOP_EVENT set)")
+        if time.monotonic() > deadline:
+            raise TimeoutError(f"Timeout waiting for {pin} stable={target}")
+
+        v = _read_pin(pin)
+        if v == target:
+            consec += 1
+            if consec >= stable_count:
+                return
+        else:
+            consec = 0
+        time.sleep(poll_s)
+
+def wait_for_homing_signature(pin: str, timeout_s: float, poll_ms: int,
+                              stable_count: int, stop_event: threading.Event = None) -> None:
+    """
+    Detect: HIGH -> LOW -> HIGH
+    """
+    poll_s = max(0.001, poll_ms / 1000.0)
+    deadline = time.monotonic() + timeout_s
+
+    print(f"[HOME] Watching {pin} for HIGH->LOW->HIGH | poll={poll_ms}ms stable_count={stable_count}")
+
+    # Ensure we're released (HIGH) at least once before looking for the hit.
+    # If we start pressed (LOW), we wait for a HIGH first.
+    print("[HOME] Stage 0: waiting for HIGH (released)")
+    _wait_stable(pin, 1, stable_count, poll_s, deadline, stop_event)
+
+    print("[HOME] Stage 1: waiting for LOW (pressed)")
+    _wait_stable(pin, 0, stable_count, poll_s, deadline, stop_event)
+
+    print("[HOME] Stage 2: waiting for HIGH again (released)")
+    _wait_stable(pin, 1, stable_count, poll_s, deadline, stop_event)
+
+    print("[HOME] Signature detected → HOMED")
 
 # =========================
 # Flow↔DAC calibration (your table)
@@ -137,10 +211,19 @@ def dac_for_flow(flow: float) -> int:
 # =========================
 # Sequences
 # =========================
-def initialisation():
+def initialisation(stop_event: threading.Event):
     print("Homing 1"); commands.write(command_homing1)
     print("Homing 2"); commands.write(command_homing2)
-    time.sleep(90)  # open plates
+
+    wait_for_homing_signature(
+        pin=HOME_LIMIT_PIN,
+        timeout_s=HOME_TIMEOUT_S,
+        poll_ms=HOME_POLL_MS,
+        stable_count=HOME_STABLE_COUNT,
+        stop_event=stop_event
+    )
+
+    print("[HOME] Initialisation complete (homed)")
 
 def filter_loading():
     print("Start roller (relay 7 ON)"); commands.write(command_start_roller)
@@ -174,13 +257,11 @@ def sample_filtration(flow: float, stop_event: threading.Event):
 def cleaning(flow: float):
     dac = dac_for_flow(flow)
     print(f"[CLEANING] {flow} mL/min → DAC {dac}"); ao(dac)
-    
-    commands.write(command_close_valve1); time.sleep(0.3)   #nec test
-    commands.write(command_close_valve2); time.sleep(0.3)   #nec test
-    commands.write(command_close_valve5); time.sleep(0.3)   #nec test 
-    
 
-    
+    commands.write(command_close_valve1); time.sleep(0.3)
+    commands.write(command_close_valve2); time.sleep(0.3)
+    commands.write(command_close_valve5); time.sleep(0.3)
+
     # MSF_empty
     commands.write(command_start_pump); time.sleep(30)
     commands.write(command_open_valve3); time.sleep(30)
@@ -240,6 +321,11 @@ def get_config():
         "cleaning_flow": cln,
         "filtration_dac": dac_for_flow(fil),
         "cleaning_dac": dac_for_flow(cln),
+        "home_limit_pin": HOME_LIMIT_PIN,
+        "home_timeout_s": HOME_TIMEOUT_S,
+        "home_poll_ms": HOME_POLL_MS,
+        "home_stable_count": HOME_STABLE_COUNT,
+        "rpiplc_profile": "RPIPLC_V6 / RPIPLC_38AR",
     })
 
 @app.post("/set_flow")
@@ -275,7 +361,8 @@ def run_step():
             return jsonify({"ok": False, "error": "Already running"}), 409
 
     if step == "initialisation":
-        _run_async(initialisation, "Initialisation")
+        STOP_EVENT.clear()
+        _run_async(lambda: initialisation(STOP_EVENT), "Initialisation")
     elif step == "filter_loading":
         _run_async(filter_loading, "Filter Loading")
     elif step == "sample_filtration":
@@ -294,7 +381,18 @@ def stop_sample():
     STOP_EVENT.set()
     return jsonify({"ok": True, "message": "Stop signal sent"})
 
+@app.get("/debug/input/<pin>")
+def debug_input(pin):
+    if rpiplc is None or not _RPIPLC_AVAILABLE:
+        return jsonify({"ok": False, "error": "rpiplc not available"}), 500
+    try:
+        val = 1 if rpiplc.digital_read(pin) else 0
+        return jsonify({"ok": True, "pin": pin, "value": val})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
 if __name__ == "__main__":
     print(f"[INFO] Static dist: {FRONTEND_DIST} (index exists: {os.path.exists(os.path.join(FRONTEND_DIST,'index.html'))})")
-    ao_init()
+    rpiplc_init()
+    print(f"[INFO] Home limit: {HOME_LIMIT_PIN} timeout={HOME_TIMEOUT_S}s poll={HOME_POLL_MS}ms stable_count={HOME_STABLE_COUNT}")
     app.run(host="0.0.0.0", port=5010, debug=False)
