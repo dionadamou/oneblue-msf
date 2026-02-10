@@ -2,7 +2,7 @@
 """
 control_api.py — API-only controller for MSF device (OneBlue MSF)
 
-Drop-in version with:
+Includes:
 - High-level steps + low-level actions
 - SSE events + optional webhook/MQTT notifications
 - RPIPLC AO (optional; disabled if DISABLE_FLOW=1 or missing)
@@ -11,13 +11,64 @@ Drop-in version with:
     - LOW   = machine power cut (E-STOP)
 - Boot default: master power HIGH (configurable)
 
-IMPORTANT NOTE:
-Your current issue is very likely because rpiplc.init() was called twice with
-two different profiles (RPIPLC_21 for AO and RPIPLC_38AR for DO). Many stacks
-don’t like that.
+Homing (timeout-based signature detection):
+- Uses RPIPLC digital input HOME_LIMIT_PIN (default I1.5)
+- Detects HIGH -> LOW -> HIGH
+- Timeout HOME_TIMEOUT_S (default 90s)
+- Poll interval HOME_POLL_MS (default 10ms)
+- Stable debounce HOME_STABLE_COUNT (default 5)
 
-This script initialises RPIPLC ONCE (single profile), then configures both AO + DO.
-Default profile is "RPIPLC_38AR" (because your DO test worked with that).
+Sample filtration by TARGET VOLUME (mL):
+- Uses SLF3x over SCC1 to integrate volume (mL) from flow (mL/min)
+- /api/run step="sample_filtration" requires "volume_ml"
+- /status includes "flowmeter" data (ok, flow, total_ml, err, etc.)
+
+NEW: SCC1 power-cycle recovery (like your logger):
+- Controls flowmeter SCC1 power via RPIPLC relay FLOW_PWR_RELAY_PIN (default R1.2)
+- Optionally power-cycles SCC1 at boot (FLOW_POWER_CYCLE_ON_BOOT=1 default)
+- On SHDLC timeouts/errors inside flow thread: power-cycle SCC1 and reconnect
+- Adds /api/action name="flow_power_cycle" (manual from other Pi)
+
+ENV VARS (key ones):
+  API_KEY=...
+  PORT=5001
+
+  # RPIPLC
+  RPIPLC_BASE=RPIPLC_V6
+  RPIPLC_PROFILE=RPIPLC_38AR
+  MASTER_POWER_PIN=R1.3
+  MASTER_POWER_DEFAULT_ON=1
+  AO_PIN=A0.5
+  DISABLE_FLOW=0
+
+  # Homing input
+  HOME_LIMIT_PIN=I1.5
+  HOME_TIMEOUT_S=90
+  HOME_POLL_MS=10
+  HOME_STABLE_COUNT=5
+
+  # Flowmeter
+  ENABLE_FLOWMETER=1
+  FLOW_PORT=/dev/ttySC3
+  FLOW_ADDR=0
+  FLOW_INTERVAL_MS=2
+  FLOW_CAL=1.0
+
+  # Flow glitch filtering
+  MAX_FLOW_ML_MIN=90.0
+  ABS_OUTLIER_ML_MIN=25.0
+  REL_OUTLIER_FACTOR=2.5
+  MIN_GOOD_SAMPLES=3
+  MAX_STEP_JUMP_ML_MIN=40.0
+  CAP_DV_PER_BATCH_ML=5.0
+  COMPENSATE_LOST_SAMPLES=1
+
+  # SCC1 power relay
+  FLOW_PWR_RELAY_PIN=R1.2
+  FLOW_PWR_ASSUME_HIGH_ON=1
+  FLOW_POWER_CYCLE_ON_BOOT=1
+  FLOW_POWER_OFF_MS=1500
+  FLOW_POWER_ON_MS=2500
 """
 
 import os, sys, time, json, uuid, hmac, hashlib, threading
@@ -39,6 +90,21 @@ try:
 except Exception:
     mqtt = None
     _MQTT_AVAILABLE = False
+
+# --------------------------------------------------------
+# Flowmeter (SLF3x over SCC1 / SHDLC) imports (optional)
+# --------------------------------------------------------
+try:
+    from sensirion_shdlc_driver import ShdlcSerialPort, ShdlcConnection
+    from sensirion_shdlc_driver.errors import ShdlcDeviceError, ShdlcTimeoutError
+    from sensirion_uart_scc1.drivers.scc1_slf3x import Scc1Slf3x
+    from sensirion_uart_scc1.drivers.slf_common import get_flow_unit_label
+    from sensirion_uart_scc1.scc1_shdlc_device import Scc1ShdlcDevice
+    FLOW_LIBS_OK = True
+    FLOW_LIBS_ERR = ""
+except Exception as e:
+    FLOW_LIBS_OK = False
+    FLOW_LIBS_ERR = str(e)
 
 # --------------------------------------------------------
 # RS485 Serial Commands (via your 'commands' module)
@@ -105,8 +171,6 @@ except Exception:
 # --------------------------------------------------------
 DISABLE_FLOW = os.environ.get("DISABLE_FLOW", "0") == "1"
 
-# Use ONE profile for BOTH DO and AO.
-# Default to 38AR because your DO test worked with that.
 RPIPLC_BASE = os.environ.get("RPIPLC_BASE", "RPIPLC_V6").strip()
 RPIPLC_PROFILE = os.environ.get("RPIPLC_PROFILE", "RPIPLC_38AR").strip()
 
@@ -114,6 +178,12 @@ AO_PIN = os.environ.get("AO_PIN", "A0.5").strip()
 
 MASTER_POWER_PIN = os.environ.get("MASTER_POWER_PIN", "R1.3").strip()
 MASTER_POWER_DEFAULT_ON = os.environ.get("MASTER_POWER_DEFAULT_ON", "1") == "1"  # boot HIGH
+
+# ----- homing input -----
+HOME_LIMIT_PIN = os.environ.get("HOME_LIMIT_PIN", "I1.5").strip()
+HOME_TIMEOUT_S = float(os.environ.get("HOME_TIMEOUT_S", "90"))
+HOME_POLL_MS = int(os.environ.get("HOME_POLL_MS", "10"))
+HOME_STABLE_COUNT = int(os.environ.get("HOME_STABLE_COUNT", "5"))
 
 FLOW_CONTROL_AVAILABLE = False
 AO_READY = False
@@ -123,17 +193,81 @@ MASTER_POWER_AVAILABLE = False
 MASTER_POWER_READY = False
 MASTER_POWER_STATE = {"enabled": False, "last_change": None, "fault": None}
 
+# --------------------------------------------------------
+# Flowmeter + volume integration
+# --------------------------------------------------------
+ENABLE_FLOWMETER = os.environ.get("ENABLE_FLOWMETER", "1") == "1"
+FLOW_PORT = os.environ.get("FLOW_PORT", "/dev/ttySC3").strip()
+FLOW_ADDR = int(os.environ.get("FLOW_ADDR", "0"))
+FLOW_INTERVAL_MS = int(os.environ.get("FLOW_INTERVAL_MS", "2"))
+
+FLOW_CAL = float(os.environ.get("FLOW_CAL", "1.0"))
+
+MAX_FLOW_ML_MIN = float(os.environ.get("MAX_FLOW_ML_MIN", "90.0"))
+ABS_OUTLIER_ML_MIN = float(os.environ.get("ABS_OUTLIER_ML_MIN", "25.0"))
+REL_OUTLIER_FACTOR = float(os.environ.get("REL_OUTLIER_FACTOR", "2.5"))
+MIN_GOOD_SAMPLES = int(os.environ.get("MIN_GOOD_SAMPLES", "3"))
+MAX_STEP_JUMP_ML_MIN = float(os.environ.get("MAX_STEP_JUMP_ML_MIN", "40.0"))
+CAP_DV_PER_BATCH_ML = float(os.environ.get("CAP_DV_PER_BATCH_ML", "5.0"))
+COMPENSATE_LOST_SAMPLES = os.environ.get("COMPENSATE_LOST_SAMPLES", "1") == "1"
+
+FLOW_LOCK = threading.Lock()
+FLOW_STATE = {
+    "ok": False,
+    "ml_min": 0.0,
+    "temp_c": 0.0,
+    "unit": "mL/min",
+    "last_ts": 0.0,
+    "err": "",
+    "total_ml": 0.0,  # integrated since API boot
+}
+
+# --------------------------------------------------------
+# SCC1 power relay (R1.2) for flowmeter recovery
+# --------------------------------------------------------
+FLOW_PWR_RELAY_PIN = os.environ.get("FLOW_PWR_RELAY_PIN", "R1.2").strip()
+FLOW_PWR_ASSUME_HIGH_ON = os.environ.get("FLOW_PWR_ASSUME_HIGH_ON", "1") == "1"  # HIGH=ON
+
+FLOW_POWER_CYCLE_ON_BOOT = os.environ.get("FLOW_POWER_CYCLE_ON_BOOT", "1") == "1"
+FLOW_POWER_OFF_MS = int(os.environ.get("FLOW_POWER_OFF_MS", "1500"))
+FLOW_POWER_ON_MS  = int(os.environ.get("FLOW_POWER_ON_MS", "2500"))
+
+def flow_power_on():
+    if rpiplc is None:
+        raise RuntimeError("rpiplc not available")
+    rpiplc.digital_write(FLOW_PWR_RELAY_PIN, rpiplc.HIGH if FLOW_PWR_ASSUME_HIGH_ON else rpiplc.LOW)
+
+def flow_power_off():
+    if rpiplc is None:
+        raise RuntimeError("rpiplc not available")
+    rpiplc.digital_write(FLOW_PWR_RELAY_PIN, rpiplc.LOW if FLOW_PWR_ASSUME_HIGH_ON else rpiplc.HIGH)
+
+def flow_power_cycle(off_ms=None, on_ms=None):
+    off_ms = FLOW_POWER_OFF_MS if off_ms is None else int(off_ms)
+    on_ms  = FLOW_POWER_ON_MS  if on_ms  is None else int(on_ms)
+    log("flow_power", f"SCC1 power cycle: OFF {off_ms}ms, ON {on_ms}ms")
+    try:
+        flow_power_off()
+        rpiplc.delay(off_ms)
+        flow_power_on()
+        rpiplc.delay(on_ms)
+    except Exception as e:
+        log("flow_power", f"Power cycle failed: {e}")
+        raise
+
 def rpiplc_init_all():
     """
     Initialise RPIPLC ONCE, then configure:
     - Master power digital output pin
     - Optional AO pin (unless DISABLE_FLOW=1)
+    - Home limit input pin (HOME_LIMIT_PIN)
+    - SCC1 power relay pin (FLOW_PWR_RELAY_PIN)
     """
     global FLOW_CONTROL_AVAILABLE, AO_READY
     global MASTER_POWER_AVAILABLE, MASTER_POWER_READY
 
     if rpiplc is None:
-        print("[RPIPLC] Not available; AO + master power disabled")
+        print("[RPIPLC] Not available; AO + master power + home input disabled")
         FLOW_CONTROL_AVAILABLE = False
         AO_READY = False
         MASTER_POWER_AVAILABLE = False
@@ -176,6 +310,33 @@ def rpiplc_init_all():
         MASTER_POWER_STATE["fault"] = str(e)
         print(f"[PWR] Master power setup FAILED: {e}")
 
+    # Home limit input
+    try:
+        rpiplc.pin_mode(HOME_LIMIT_PIN, rpiplc.INPUT)
+        print(f"[HOME] Limit input ready: {HOME_LIMIT_PIN}")
+    except Exception as e:
+        print(f"[HOME] Limit input setup FAILED on {HOME_LIMIT_PIN}: {e}")
+
+    # SCC1 power relay pin
+    try:
+        rpiplc.pin_mode(FLOW_PWR_RELAY_PIN, rpiplc.OUTPUT)
+        print(f"[FLOW_PWR] Relay pin ready: {FLOW_PWR_RELAY_PIN}")
+        try:
+            flow_power_on()
+            rpiplc.delay(200)
+        except Exception:
+            pass
+
+        if FLOW_POWER_CYCLE_ON_BOOT:
+            try:
+                # clean SCC1 boot (your setup needs it)
+                flow_power_cycle(FLOW_POWER_OFF_MS, FLOW_POWER_ON_MS)
+            except Exception:
+                pass
+
+    except Exception as e:
+        print(f"[FLOW_PWR] Relay setup FAILED on {FLOW_PWR_RELAY_PIN}: {e}")
+
     # AO (optional)
     if DISABLE_FLOW:
         print("[AO] DISABLE_FLOW=1 → Flow control forced OFF")
@@ -192,48 +353,6 @@ def rpiplc_init_all():
         FLOW_CONTROL_AVAILABLE = False
         AO_READY = False
         print(f"[AO] AO setup FAILED: {e}")
-
-def master_power_set(enable: bool, reason: str = ""):
-    if not (MASTER_POWER_AVAILABLE and MASTER_POWER_READY):
-        raise RuntimeError("Master power control unavailable")
-    rpiplc.digital_write(MASTER_POWER_PIN, rpiplc.HIGH if enable else rpiplc.LOW)
-    MASTER_POWER_STATE["enabled"] = bool(enable)
-    MASTER_POWER_STATE["last_change"] = time.time()
-    MASTER_POWER_STATE["fault"] = None
-    EVENTS.publish({"type": "power", "enabled": bool(enable), "reason": reason, "ts": time.time()})
-    NOTIFY.publish({"type": "power", "enabled": bool(enable), "reason": reason, "ts": time.time()})
-    log("power", f"Master power {'ENABLED' if enable else 'DISABLED'}", reason=reason)
-
-def ao(value: int):
-    global _AO_WARNED
-    if not (AO_READY and FLOW_CONTROL_AVAILABLE):
-        if not _AO_WARNED:
-            print("[AO] AO write ignored: Flow control unavailable")
-            _AO_WARNED = True
-        return
-    try:
-        rpiplc.analog_write(AO_PIN, value)
-    except Exception as e:
-        print(f"[AO] write failed: {e}")
-
-FLOW_TO_DAC = {
-     5.6: 250,
-     8.3: 276,
-     9.6: 300,
-    20.8: 400,
-    32.6: 500,
-    39.0: 600,
-    54.5: 750,
-    76.9: 1000,
-   100.0: 1250,
-   115.4: 1500,
-   117.6: 1750,
-   125.0: 2000,
-}
-FLOW_OPTIONS = sorted(FLOW_TO_DAC.keys())
-
-def dac_for_flow(flow: float) -> int:
-    return FLOW_TO_DAC.get(flow, FLOW_TO_DAC[min(FLOW_TO_DAC, key=lambda f: abs(f-flow))])
 
 # --------------------------------------------------------
 # Outbound Notifications (webhook + MQTT)
@@ -366,13 +485,293 @@ def log(kind, msg, **extra):
     NOTIFY.publish(ev)
 
 # --------------------------------------------------------
+# Master power + AO
+# --------------------------------------------------------
+def master_power_set(enable: bool, reason: str = ""):
+    if not (MASTER_POWER_AVAILABLE and MASTER_POWER_READY):
+        raise RuntimeError("Master power control unavailable")
+    rpiplc.digital_write(MASTER_POWER_PIN, rpiplc.HIGH if enable else rpiplc.LOW)
+    MASTER_POWER_STATE["enabled"] = bool(enable)
+    MASTER_POWER_STATE["last_change"] = time.time()
+    MASTER_POWER_STATE["fault"] = None
+    EVENTS.publish({"type": "power", "enabled": bool(enable), "reason": reason, "ts": time.time()})
+    NOTIFY.publish({"type": "power", "enabled": bool(enable), "reason": reason, "ts": time.time()})
+    log("power", f"Master power {'ENABLED' if enable else 'DISABLED'}", reason=reason)
+
+def ao(value: int):
+    global _AO_WARNED
+    if not (AO_READY and FLOW_CONTROL_AVAILABLE):
+        if not _AO_WARNED:
+            print("[AO] AO write ignored: Flow control unavailable")
+            _AO_WARNED = True
+        return
+    try:
+        rpiplc.analog_write(AO_PIN, int(value))
+    except Exception as e:
+        print(f"[AO] write failed: {e}")
+
+# --------------------------------------------------------
+# Flow->DAC table (your updated one)
+# --------------------------------------------------------
+FLOW_TO_DAC = {
+     5: 250,
+     9: 300,
+     17: 400,
+     25: 500,
+     34: 600,
+     43: 700,
+     51: 800,
+     59: 900,
+}
+FLOW_OPTIONS = sorted(FLOW_TO_DAC.keys())
+
+def dac_for_flow(flow: float) -> int:
+    f = float(flow)
+    return int(FLOW_TO_DAC.get(f, FLOW_TO_DAC[min(FLOW_TO_DAC, key=lambda x: abs(x - f))]))
+
+# --------------------------------------------------------
+# Flow thread (SLF3x) — integration to total_ml
+# --------------------------------------------------------
+def _median(vals):
+    s = sorted(vals)
+    n = len(s)
+    if n == 0:
+        return 0.0
+    mid = n // 2
+    return s[mid] if (n % 2 == 1) else 0.5 * (s[mid - 1] + s[mid])
+
+def _init_slf3x_sensor():
+    port = ShdlcSerialPort(port=FLOW_PORT, baudrate=115200)
+    device = Scc1ShdlcDevice(ShdlcConnection(port), slave_address=FLOW_ADDR)
+    sensor = Scc1Slf3x(device)
+
+    flow_scale, unit = sensor.get_flow_unit_and_scale()
+    unit_label = get_flow_unit_label(unit)
+
+    sensor.start_continuous_measurement(interval_ms=FLOW_INTERVAL_MS)
+    return port, sensor, flow_scale, unit_label
+
+def flow_reader_thread():
+    last_good_flow = 0.0
+    last_good_temp = 0.0
+    last_batch_t = time.monotonic()
+
+    while True:
+        port = None
+        sensor = None
+        try:
+            if not ENABLE_FLOWMETER:
+                with FLOW_LOCK:
+                    FLOW_STATE["ok"] = False
+                    FLOW_STATE["err"] = "ENABLE_FLOWMETER=0"
+                    FLOW_STATE["last_ts"] = time.time()
+                time.sleep(2.0)
+                continue
+
+            if not FLOW_LIBS_OK:
+                with FLOW_LOCK:
+                    FLOW_STATE["ok"] = False
+                    FLOW_STATE["err"] = f"flow libs missing: {FLOW_LIBS_ERR}"
+                    FLOW_STATE["last_ts"] = time.time()
+                time.sleep(2.0)
+                continue
+
+            # Ensure SCC1 is ON (best-effort)
+            try:
+                if rpiplc is not None:
+                    flow_power_on()
+                    rpiplc.delay(100)
+            except Exception:
+                pass
+
+            port, sensor, flow_scale, unit_label = _init_slf3x_sensor()
+
+            with FLOW_LOCK:
+                FLOW_STATE["ok"] = True
+                FLOW_STATE["unit"] = unit_label
+                FLOW_STATE["err"] = ""
+                FLOW_STATE["last_ts"] = time.time()
+
+            last_batch_t = time.monotonic()
+
+            while True:
+                remaining, lost, data = sensor.read_extended_buffer()
+                if not data:
+                    continue
+
+                now_t = time.monotonic()
+                dt_total = now_t - last_batch_t
+                last_batch_t = now_t
+
+                raw_flow = [(FLOW_CAL * (f / flow_scale)) for (f, temp, flag) in data]
+                raw_temp = [(temp / 200.0) for (f, temp, flag) in data]
+
+                # clamp
+                clamped = []
+                for x in raw_flow:
+                    if x < 0:
+                        x = 0.0
+                    if x > MAX_FLOW_ML_MIN:
+                        x = MAX_FLOW_ML_MIN
+                    clamped.append(x)
+
+                med = _median(clamped)
+
+                # outlier rejection vs median
+                good = []
+                for x in clamped:
+                    if abs(x - med) <= ABS_OUTLIER_ML_MIN and x <= (med * REL_OUTLIER_FACTOR + 1e-9):
+                        good.append(x)
+
+                if len(good) < MIN_GOOD_SAMPLES:
+                    with FLOW_LOCK:
+                        FLOW_STATE["ok"] = True  # comms ok, data glitch
+                        FLOW_STATE["ml_min"] = float(last_good_flow)
+                        FLOW_STATE["temp_c"] = float(last_good_temp)
+                        FLOW_STATE["last_ts"] = time.time()
+                        FLOW_STATE["err"] = "glitch batch ignored"
+                    continue
+
+                flow_mean = sum(good) / len(good)
+                temp_mean = (sum(raw_temp) / len(raw_temp)) if raw_temp else last_good_temp
+
+                # jump rejection
+                if abs(flow_mean - last_good_flow) > MAX_STEP_JUMP_ML_MIN:
+                    with FLOW_LOCK:
+                        FLOW_STATE["ok"] = True
+                        FLOW_STATE["ml_min"] = float(last_good_flow)
+                        FLOW_STATE["temp_c"] = float(last_good_temp)
+                        FLOW_STATE["last_ts"] = time.time()
+                        FLOW_STATE["err"] = "flow jump ignored"
+                    continue
+
+                lost_n = int(lost) if (lost is not None and lost > 0) else 0
+                n_total = len(good) + (lost_n if COMPENSATE_LOST_SAMPLES else 0)
+                if n_total <= 0:
+                    continue
+
+                dt_per = dt_total / float(n_total)
+                dV_ml = (sum(good) * dt_per) / 60.0
+
+                if COMPENSATE_LOST_SAMPLES and lost_n > 0:
+                    dV_ml += (lost_n * flow_mean * dt_per) / 60.0
+
+                # safety cap per batch
+                if dV_ml < 0:
+                    dV_ml = 0.0
+                if dV_ml > CAP_DV_PER_BATCH_ML:
+                    dV_ml = CAP_DV_PER_BATCH_ML
+
+                last_good_flow = flow_mean
+                last_good_temp = temp_mean
+
+                with FLOW_LOCK:
+                    FLOW_STATE["ok"] = True
+                    FLOW_STATE["ml_min"] = float(flow_mean)
+                    FLOW_STATE["temp_c"] = float(temp_mean)
+                    FLOW_STATE["last_ts"] = time.time()
+                    FLOW_STATE["err"] = ""
+                    FLOW_STATE["total_ml"] = float(FLOW_STATE.get("total_ml", 0.0) + dV_ml)
+
+        except (ShdlcDeviceError, ShdlcTimeoutError) as e:
+            with FLOW_LOCK:
+                FLOW_STATE["ok"] = False
+                FLOW_STATE["err"] = f"SHDLC error: {e}"
+                FLOW_STATE["last_ts"] = time.time()
+            log("flow", f"SHDLC error -> power cycle SCC1: {e}")
+            try:
+                if rpiplc is not None:
+                    flow_power_cycle()
+            except Exception:
+                pass
+            time.sleep(1.0)
+
+        except Exception as e:
+            with FLOW_LOCK:
+                FLOW_STATE["ok"] = False
+                FLOW_STATE["err"] = f"Flow thread error: {e}"
+                FLOW_STATE["last_ts"] = time.time()
+            log("flow", f"Flow thread error -> power cycle SCC1: {e}")
+            try:
+                if rpiplc is not None:
+                    flow_power_cycle()
+            except Exception:
+                pass
+            time.sleep(1.0)
+
+        finally:
+            try:
+                if sensor is not None:
+                    sensor.stop_continuous_measurement()
+                    time.sleep(0.2)
+            except Exception:
+                pass
+            try:
+                if port is not None:
+                    port.close()
+            except Exception:
+                pass
+            time.sleep(0.5)
+
+def get_total_ml() -> float:
+    with FLOW_LOCK:
+        return float(FLOW_STATE.get("total_ml", 0.0) or 0.0)
+
+# --------------------------------------------------------
+# HOMING WAIT (HIGH -> LOW -> HIGH) with timeout
+# --------------------------------------------------------
+def _read_home_pin() -> int:
+    return 1 if rpiplc.digital_read(HOME_LIMIT_PIN) else 0
+
+def _wait_stable(target: int, stable_count: int, poll_s: float,
+                 deadline: float, stop_event: threading.Event = None) -> None:
+    consec = 0
+    while True:
+        if stop_event is not None and stop_event.is_set():
+            raise RuntimeError("Aborted (STOP_EVENT set)")
+        if time.monotonic() > deadline:
+            raise TimeoutError(f"Timeout waiting for {HOME_LIMIT_PIN} stable={target}")
+
+        v = _read_home_pin()
+        if v == target:
+            consec += 1
+            if consec >= stable_count:
+                return
+        else:
+            consec = 0
+        time.sleep(poll_s)
+
+def wait_for_homing_signature(stop_event: threading.Event = None) -> None:
+    """
+    Detect: HIGH -> LOW -> HIGH on HOME_LIMIT_PIN.
+    pressed=LOW, released=HIGH
+    """
+    if rpiplc is None:
+        raise RuntimeError("rpiplc not available (cannot read home pin)")
+    poll_s = max(0.001, HOME_POLL_MS / 1000.0)
+    deadline = time.monotonic() + HOME_TIMEOUT_S
+
+    log("home", f"Watching {HOME_LIMIT_PIN} for HIGH->LOW->HIGH (timeout={HOME_TIMEOUT_S}s poll={HOME_POLL_MS}ms stable={HOME_STABLE_COUNT})")
+
+    log("home", "Stage 0: waiting for HIGH (released)")
+    _wait_stable(1, HOME_STABLE_COUNT, poll_s, deadline, stop_event)
+
+    log("home", "Stage 1: waiting for LOW (pressed)")
+    _wait_stable(0, HOME_STABLE_COUNT, poll_s, deadline, stop_event)
+
+    log("home", "Stage 2: waiting for HIGH again (released)")
+    _wait_stable(1, HOME_STABLE_COUNT, poll_s, deadline, stop_event)
+
+    log("home", "Signature detected → HOMED")
+
+# --------------------------------------------------------
 # App State + Job System
 # --------------------------------------------------------
 RUN_LOCK = threading.Lock()
 RUNNING = {"active": False, "step": "idle", "last": "", "can_stop": False}
 STOP_EVENT = threading.Event()
 
-CONFIG = {"filtration_flow": 39.0, "cleaning_flow": 100.0}
+CONFIG = {"filtration_flow": 17.0, "cleaning_flow": 59.0}
 JOBS: Dict[str, Dict[str, Any]] = {}
 WRITE_RETRIES = 2
 
@@ -388,12 +787,6 @@ def write_cmd(payload, label):
     raise RuntimeError(f"{label} write failed: {last_exc}")
 
 def emergency_power_cut(reason: str = "emergency"):
-    """
-    HARD E-STOP:
-    - Cut machine power via master relay (LOW)
-    - Signal STOP_EVENT so any loops exit
-    - Mark RUNNING idle
-    """
     STOP_EVENT.set()
 
     try:
@@ -455,7 +848,7 @@ def step_initialisation():
     write_cmd(command_homing1, "homing1")
     log("step", "Homing 2")
     write_cmd(command_homing2, "homing2")
-    time.sleep(90)
+    wait_for_homing_signature(stop_event=STOP_EVENT)
 
 def step_filter_loading():
     log("step", "Start roller")
@@ -474,9 +867,26 @@ def step_filter_loading():
 
     log("step", "Plate press")
     write_cmd(command_stepper_press, "stepper_press")
-    time.sleep(70)
+    time.sleep(30)
 
-def step_sample_filtration(flow: float):
+def step_sample_filtration(flow: float, target_ml: float):
+    if target_ml is None:
+        raise ValueError("target_ml is required")
+    target_ml = float(target_ml)
+    if target_ml <= 0:
+        raise ValueError("target_ml must be > 0")
+
+    # Require flowmeter OK for volume-based stop
+    with FLOW_LOCK:
+        fm_ok = bool(FLOW_STATE.get("ok", False))
+        fm_err = str(FLOW_STATE.get("err", ""))
+    if not (ENABLE_FLOWMETER and fm_ok):
+        raise RuntimeError(f"Flowmeter not OK (ENABLE_FLOWMETER={ENABLE_FLOWMETER}) err={fm_err}")
+
+    baseline = get_total_ml()
+    log("wait", f"Volume baseline set: total_ml={baseline:.3f} mL")
+
+    # AO set (optional)
     if FLOW_CONTROL_AVAILABLE and AO_READY:
         dac = dac_for_flow(flow)
         log("ao", f"Flow {flow} mL/min → DAC {dac}")
@@ -484,25 +894,22 @@ def step_sample_filtration(flow: float):
     else:
         log("ao", f"Flow control disabled → ignoring requested {flow} mL/min")
 
-    log("step", "Open valve 1")
-    write_cmd(command_open_valve1, "open_v1")
-
-    log("step", "Open valve 2")
-    write_cmd(command_open_valve2, "open_v2")
-
-    log("step", "Open valve 5")
-    write_cmd(command_open_valve5, "open_v5")
-
-    log("step", "Start pump")
-    write_cmd(command_start_pump, "pump_start")
+    # valves + pump
+    log("step", "Open valve 1"); write_cmd(command_open_valve1, "open_v1")
+    log("step", "Open valve 2"); write_cmd(command_open_valve2, "open_v2")
+    log("step", "Open valve 5"); write_cmd(command_open_valve5, "open_v5")
+    log("step", "Start pump");   write_cmd(command_start_pump, "pump_start")
 
     with RUN_LOCK:
         RUNNING["can_stop"] = True
 
-    log("wait", "Filtration running... waiting for stop")
+    log("wait", f"Filtration running... target={target_ml:.2f} mL")
     try:
         while not STOP_EVENT.wait(0.2):
-            pass
+            delivered = max(0.0, get_total_ml() - baseline)
+            if delivered >= target_ml:
+                log("wait", f"Target reached ({delivered:.2f} mL) → stopping")
+                break
     finally:
         log("step", "Stopping filtration...")
         try:
@@ -530,16 +937,16 @@ def step_cleaning(flow: float):
         log("ao", f"Flow control disabled → ignoring cleaning flow={flow}")
 
     write_cmd(command_start_pump, "pump_start")
-    time.sleep(60)
+    time.sleep(75)
 
     write_cmd(command_open_valve3, "open_v3")
-    time.sleep(60)
+    time.sleep(75)
 
     write_cmd(command_open_valve4, "open_v4")
-    time.sleep(60)
+    time.sleep(75)
 
     write_cmd(command_stop_pump, "pump_stop")
-    time.sleep(60)
+    time.sleep(75)
 
     write_cmd(command_close_valve3, "close_v3")
     write_cmd(command_close_valve4, "close_v4")
@@ -562,7 +969,7 @@ def step_cleaning(flow: float):
     write_cmd(command_start_pump, "pump_start")
     time.sleep(90)
     write_cmd(command_close_valve2, "close_v2")
-    time.sleep(60)
+    time.sleep(75)
     write_cmd(command_stop_pump, "pump_stop")
 
 # --------------------------------------------------------
@@ -581,20 +988,34 @@ def _set_flow(flow: float):
         raise RuntimeError("Flow control unavailable on this MSF unit")
     ao(dac_for_flow(flow))
 
+def _set_dac(dac: int):
+    if not (FLOW_CONTROL_AVAILABLE and AO_READY):
+        raise RuntimeError("Flow control unavailable on this MSF unit")
+    d = int(dac)
+    d = max(0, min(4095, d))
+    ao(d)
+
+def _flow_power_cycle(args: dict):
+    off_ms = int(args.get("off_ms", FLOW_POWER_OFF_MS))
+    on_ms  = int(args.get("on_ms", FLOW_POWER_ON_MS))
+    flow_power_cycle(off_ms=off_ms, on_ms=on_ms)
+
 ACTIONS = {
-    "open_valve":     lambda a: _open_valve(int(a["id"])),
-    "close_valve":    lambda a: _close_valve(int(a["id"])),
-    "pump_start":     lambda a: write_cmd(command_start_pump, "pump_start"),
-    "pump_stop":      lambda a: write_cmd(command_stop_pump, "pump_stop"),
-    "roller_start":   lambda a: write_cmd(command_start_roller, "roller_start"),
-    "roller_stop":    lambda a: write_cmd(command_stop_roller, "roller_stop"),
-    "base_back_on":   lambda a: write_cmd(command_base_back_on, "base_back_on"),
-    "base_back_off":  lambda a: write_cmd(command_base_back_off, "base_back_off"),
-    "base_front_on":  lambda a: write_cmd(command_move_base_front_on, "base_front_on"),
-    "base_front_off": lambda a: write_cmd(command_move_base_front_off, "base_front_off"),
-    "stepper_press":  lambda a: write_cmd(command_stepper_press, "stepper_press"),
-    "stepper_open":   lambda a: write_cmd(command_stepper_open, "stepper_open"),
-    "set_flow":       lambda a: _set_flow(float(a["flow"])),
+    "open_valve":       lambda a: _open_valve(int(a["id"])),
+    "close_valve":      lambda a: _close_valve(int(a["id"])),
+    "pump_start":       lambda a: write_cmd(command_start_pump, "pump_start"),
+    "pump_stop":        lambda a: write_cmd(command_stop_pump, "pump_stop"),
+    "roller_start":     lambda a: write_cmd(command_start_roller, "roller_start"),
+    "roller_stop":      lambda a: write_cmd(command_stop_roller, "roller_stop"),
+    "base_back_on":     lambda a: write_cmd(command_base_back_on, "base_back_on"),
+    "base_back_off":    lambda a: write_cmd(command_base_back_off, "base_back_off"),
+    "base_front_on":    lambda a: write_cmd(command_move_base_front_on, "base_front_on"),
+    "base_front_off":   lambda a: write_cmd(command_move_base_front_off, "base_front_off"),
+    "stepper_press":    lambda a: write_cmd(command_stepper_press, "stepper_press"),
+    "stepper_open":     lambda a: write_cmd(command_stepper_open, "stepper_open"),
+    "set_flow":         lambda a: _set_flow(float(a["flow"])),
+    "set_dac":          lambda a: _set_dac(int(a["dac"])),
+    "flow_power_cycle": lambda a: _flow_power_cycle(a),
 }
 
 # --------------------------------------------------------
@@ -619,12 +1040,30 @@ def healthz():
         "ao_ready": AO_READY,
         "flow_control_available": FLOW_CONTROL_AVAILABLE,
         "flow_disabled_by_env": DISABLE_FLOW,
+
         "master_power_available": MASTER_POWER_AVAILABLE,
         "master_power_ready": MASTER_POWER_READY,
         "master_power_enabled": MASTER_POWER_STATE["enabled"],
         "master_power_fault": MASTER_POWER_STATE["fault"],
         "master_power_pin": MASTER_POWER_PIN,
         "rpiplc_profile": RPIPLC_PROFILE,
+
+        "home_limit_pin": HOME_LIMIT_PIN,
+        "home_timeout_s": HOME_TIMEOUT_S,
+        "home_poll_ms": HOME_POLL_MS,
+        "home_stable_count": HOME_STABLE_COUNT,
+
+        "enable_flowmeter": ENABLE_FLOWMETER,
+        "flow_libs_ok": FLOW_LIBS_OK,
+        "flow_libs_err": FLOW_LIBS_ERR,
+        "flow_port": FLOW_PORT,
+        "flow_addr": FLOW_ADDR,
+        "flow_interval_ms": FLOW_INTERVAL_MS,
+
+        "flow_pwr_relay_pin": FLOW_PWR_RELAY_PIN,
+        "flow_power_cycle_on_boot": FLOW_POWER_CYCLE_ON_BOOT,
+        "flow_power_off_ms": FLOW_POWER_OFF_MS,
+        "flow_power_on_ms": FLOW_POWER_ON_MS,
     })
 
 @app.get("/status")
@@ -633,6 +1072,8 @@ def get_status():
     with RUN_LOCK:
         s = dict(RUNNING)
     s["master_power"] = dict(MASTER_POWER_STATE)
+    with FLOW_LOCK:
+        s["flowmeter"] = dict(FLOW_STATE)
     return jsonify(s)
 
 @app.get("/api/events")
@@ -691,16 +1132,25 @@ def api_run():
         return jsonify({"ok": False, "error": "Machine power is DISABLED. Enable via /api/power"}), 409
 
     if step == "initialisation":
+        STOP_EVENT.clear()
         job = run_async("Initialisation", step_initialisation)
 
     elif step == "filter_loading":
         job = run_async("Filter Loading", step_filter_loading)
 
     elif step == "sample_filtration":
+        STOP_EVENT.clear()
+
+        vol = data.get("volume_ml", None)
+        if vol is None:
+            return jsonify({"ok": False, "error": "sample_filtration requires 'volume_ml'"}), 400
+
         if flow_override is not None and not FLOW_CONTROL_AVAILABLE:
             return jsonify({"ok": False, "error": "Flow control unavailable; do NOT provide 'flow'"}), 400
+
         f = float(flow_override) if flow_override is not None else CONFIG["filtration_flow"]
-        job = run_async("Sample Filtration", lambda: step_sample_filtration(f))
+        v = float(vol)
+        job = run_async("Sample Filtration", lambda: step_sample_filtration(f, v))
 
     elif step == "cleaning":
         if flow_override is not None and not FLOW_CONTROL_AVAILABLE:
@@ -762,11 +1212,18 @@ def api_action():
 if __name__ == "__main__":
     rpiplc_init_all()
 
+    # Start flowmeter thread (if enabled)
+    if ENABLE_FLOWMETER:
+        threading.Thread(target=flow_reader_thread, daemon=True).start()
+        log("flow", f"Flowmeter thread started on {FLOW_PORT}")
+    else:
+        log("flow", "Flowmeter disabled (ENABLE_FLOWMETER=0)")
+
     NOTIFY.start()
     log("hello", "MSF API booted")
 
     host = os.environ.get("HOST", "0.0.0.0")
-    port = int(os.environ.get("PORT", "5000"))
+    port = int(os.environ.get("PORT", "5001"))
     print(f"[INFO] API key {'ENABLED' if API_KEY else 'DISABLED'}")
     print(f"[INFO] Listening on http://{host}:{port}")
 
